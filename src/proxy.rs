@@ -5,24 +5,53 @@ use hyper::{
     Body, Client, Method, Request, Response, Server,
 };
 use rand::Rng;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpSocket,
+    sync::Mutex,
 };
+
+struct IpState {
+    ip: IpAddr,
+    expiration: Instant,
+    client: Option<Client<HttpConnector>>,
+}
 
 pub async fn start_proxy(
     listen_addr: SocketAddr,
     (ipv6, prefix_len): (Ipv6Addr, u8),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let make_service = make_service_fn(move |_: &AddrStream| async move {
-        Ok::<_, hyper::Error>(service_fn(move |req| {
-            Proxy {
-                ipv6: ipv6.into(),
-                prefix_len,
-            }
-            .proxy(req)
-        }))
+    let rotation_seconds = std::env::var("IPV6_ROTATION_SECONDS")
+        .unwrap_or_else(|_| "300".to_string()) // Default to 5 minutes
+        .parse::<u64>()
+        .unwrap_or(300);
+
+    let ip_state = Arc::new(Mutex::new(IpState {
+        ip: get_rand_ipv6(ipv6.into(), prefix_len),
+        expiration: Instant::now() + Duration::from_secs(rotation_seconds),
+        client: None,
+    }));
+
+    let make_service = make_service_fn(move |_: &AddrStream| {
+        let ip_state = Arc::clone(&ip_state);
+        let proxy = Proxy {
+            ipv6: ipv6.into(),
+            prefix_len,
+            rotation_seconds,
+            ip_state,
+        };
+        
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req| {
+                let proxy = proxy.clone();
+                proxy.proxy(req)
+            }))
+        }
     });
 
     Server::bind(&listen_addr)
@@ -37,9 +66,47 @@ pub async fn start_proxy(
 pub(crate) struct Proxy {
     pub ipv6: u128,
     pub prefix_len: u8,
+    pub rotation_seconds: u64,
+    pub ip_state: Arc<Mutex<IpState>>,
 }
 
 impl Proxy {
+    async fn get_or_rotate_ip_state(&self) -> (IpAddr, Client<HttpConnector>) {
+        let mut state = self.ip_state.lock().await;
+        let now = Instant::now();
+
+        if now >= state.expiration {
+            // Time to rotate
+            let new_ip = get_rand_ipv6(self.ipv6, self.prefix_len);
+            println!("Rotating to new IPv6 address: {}", new_ip);
+            
+            let mut http = HttpConnector::new();
+            http.set_local_address(Some(new_ip));
+            
+            let client = Client::builder()
+                .http1_title_case_headers(true)
+                .http1_preserve_header_case(true)
+                .build(http);
+
+            state.ip = new_ip;
+            state.expiration = now + Duration::from_secs(self.rotation_seconds);
+            state.client = Some(client);
+        } else if state.client.is_none() {
+            // Initialize client if not exists
+            let mut http = HttpConnector::new();
+            http.set_local_address(Some(state.ip));
+            
+            let client = Client::builder()
+                .http1_title_case_headers(true)
+                .http1_preserve_header_case(true)
+                .build(http);
+
+            state.client = Some(client);
+        }
+
+        (state.ip, state.client.as_ref().unwrap().clone())
+    }
+
     pub(crate) async fn proxy(self, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
         match if req.method() == Method::CONNECT {
             self.process_connect(req).await
@@ -52,29 +119,26 @@ impl Proxy {
     }
 
     async fn process_connect(self, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+        let (ip, _) = self.get_or_rotate_ip_state().await;
+        
         tokio::task::spawn(async move {
             let remote_addr = req.uri().authority().map(|auth| auth.to_string()).unwrap();
             let mut upgraded = hyper::upgrade::on(req).await.unwrap();
-            self.tunnel(&mut upgraded, remote_addr).await
+            self.tunnel(&mut upgraded, remote_addr, ip).await
         });
+        
         Ok(Response::new(Body::empty()))
     }
 
     async fn process_request(self, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-        let bind_addr = get_rand_ipv6(self.ipv6, self.prefix_len);
-        let mut http = HttpConnector::new();
-        http.set_local_address(Some(bind_addr));
-        println!("{} via {bind_addr}", req.uri().host().unwrap_or_default());
-
-        let client = Client::builder()
-            .http1_title_case_headers(true)
-            .http1_preserve_header_case(true)
-            .build(http);
+        let (ip, client) = self.get_or_rotate_ip_state().await;
+        println!("{} via {}", req.uri().host().unwrap_or_default(), ip);
+        
         let res = client.request(req).await?;
         Ok(res)
     }
 
-    async fn tunnel<A>(self, upgraded: &mut A, addr_str: String) -> std::io::Result<()>
+    async fn tunnel<A>(self, upgraded: &mut A, addr_str: String, bind_ip: IpAddr) -> std::io::Result<()>
     where
         A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -90,7 +154,7 @@ impl Proxy {
                         }
                     };
 
-                    let bind_addr = get_rand_ipv6_socket_addr(self.ipv6, self.prefix_len);
+                    let bind_addr = SocketAddr::new(bind_ip, rand::thread_rng().gen::<u16>());
                     
                     match socket.bind(bind_addr) {
                         Ok(()) => {
