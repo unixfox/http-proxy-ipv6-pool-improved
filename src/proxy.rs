@@ -16,7 +16,7 @@ use tokio::{
     sync::Mutex,
 };
 
-struct IpState {
+pub(crate) struct IpState {
     ip: IpAddr,
     expiration: Instant,
     client: Option<Client<HttpConnector>>,
@@ -206,11 +206,6 @@ impl Proxy {
             }
         }
     }
-}
-
-fn get_rand_ipv6_socket_addr(ipv6: u128, prefix_len: u8) -> SocketAddr {
-    let mut rng = rand::thread_rng();
-    SocketAddr::new(get_rand_ipv6(ipv6, prefix_len), rng.gen::<u16>())
 }
 
 fn get_rand_ipv6(mut ipv6: u128, prefix_len: u8) -> IpAddr {
