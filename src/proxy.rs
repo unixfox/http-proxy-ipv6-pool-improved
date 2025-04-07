@@ -9,6 +9,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::{Duration, Instant},
+    str::FromStr,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -22,6 +23,40 @@ pub(crate) struct IpState {
     client: Option<Client<HttpConnector>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    None,
+    Error,
+    Info,
+}
+
+impl PartialOrd for LogLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Define the ordering: None < Error < Info
+        let to_num = |level: &LogLevel| -> u8 {
+            match level {
+                LogLevel::None => 0,
+                LogLevel::Error => 1,
+                LogLevel::Info => 2,
+            }
+        };
+        to_num(self).partial_cmp(&to_num(other))
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(LogLevel::None),
+            "error" => Ok(LogLevel::Error),
+            "info" => Ok(LogLevel::Info),
+            _ => Err(format!("Invalid log level: {}", s)),
+        }
+    }
+}
+
 pub async fn start_proxy(
     listen_addr: SocketAddr,
     (ipv6, prefix_len): (Ipv6Addr, u8),
@@ -30,6 +65,11 @@ pub async fn start_proxy(
         .unwrap_or_else(|_| "300".to_string()) // Default to 5 minutes
         .parse::<u64>()
         .unwrap_or(300);
+
+    let log_level = std::env::var("LOG_LEVEL")
+        .unwrap_or_else(|_| "info".to_string())
+        .parse::<LogLevel>()
+        .unwrap_or(LogLevel::Info);
 
     let ip_state = Arc::new(Mutex::new(IpState {
         ip: get_rand_ipv6(ipv6.into(), prefix_len),
@@ -44,6 +84,7 @@ pub async fn start_proxy(
             prefix_len,
             rotation_seconds,
             ip_state,
+            log_level,
         };
         
         async move {
@@ -68,9 +109,16 @@ pub(crate) struct Proxy {
     pub prefix_len: u8,
     pub rotation_seconds: u64,
     pub ip_state: Arc<Mutex<IpState>>,
+    pub log_level: LogLevel,
 }
 
 impl Proxy {
+    fn log(&self, level: LogLevel, message: &str) {
+        if level <= self.log_level {
+            println!("{}", message);
+        }
+    }
+
     async fn get_or_rotate_ip_state(&self) -> (IpAddr, Client<HttpConnector>) {
         let mut state = self.ip_state.lock().await;
         let now = Instant::now();
@@ -78,7 +126,7 @@ impl Proxy {
         if now >= state.expiration {
             // Time to rotate
             let new_ip = get_rand_ipv6(self.ipv6, self.prefix_len);
-            println!("Rotating to new IPv6 address: {}", new_ip);
+            self.log(LogLevel::Info, &format!("Rotating to new IPv6 address: {}", new_ip));
             
             let mut http = HttpConnector::new();
             http.set_local_address(Some(new_ip));
@@ -132,7 +180,7 @@ impl Proxy {
 
     async fn process_request(self, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
         let (ip, client) = self.get_or_rotate_ip_state().await;
-        println!("{} via {}", req.uri().host().unwrap_or_default(), ip);
+        self.log(LogLevel::Info, &format!("{} via {}", req.uri().host().unwrap_or_default(), ip));
         
         let res = client.request(req).await?;
         Ok(res)
@@ -149,7 +197,7 @@ impl Proxy {
                     let socket = match TcpSocket::new_v6() {
                         Ok(s) => s,
                         Err(e) => {
-                            println!("Failed to create IPv6 socket for {addr_str}: {e}");
+                            self.log(LogLevel::Error, &format!("Failed to create IPv6 socket for {addr_str}: {e}"));
                             continue;
                         }
                     };
@@ -158,7 +206,7 @@ impl Proxy {
                     
                     match socket.bind(bind_addr) {
                         Ok(()) => {
-                            println!("{addr_str} via {bind_addr}");
+                            self.log(LogLevel::Info, &format!("{addr_str} via {bind_addr}"));
                             
                             match socket.connect(addr).await {
                                 Ok(server) => {
@@ -172,24 +220,24 @@ impl Proxy {
                                         (Ok(_), Ok(_)) => return Ok(()),
                                         (Err(e), _) | (_, Err(e)) => {
                                             if e.kind() == std::io::ErrorKind::ConnectionReset {
-                                                println!("Connection reset for {addr_str}, trying next address");
+                                                self.log(LogLevel::Error, &format!("Connection reset for {addr_str}, trying next address"));
                                                 continue;
                                             }
-                                            println!("Connection error for {addr_str}: {e}");
+                                            self.log(LogLevel::Error, &format!("Connection error for {addr_str}: {e}"));
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     if e.kind() == std::io::ErrorKind::InvalidInput {
-                                        println!("Invalid IPv6 address for {addr_str}, trying next address");
+                                        self.log(LogLevel::Error, &format!("Invalid IPv6 address for {addr_str}, trying next address"));
                                         continue;
                                     }
-                                    println!("Failed to connect to {addr_str}: {e}");
+                                    self.log(LogLevel::Error, &format!("Failed to connect to {addr_str}: {e}"));
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("Failed to bind to {bind_addr} for {addr_str}: {e}");
+                            self.log(LogLevel::Error, &format!("Failed to bind to {bind_addr} for {addr_str}: {e}"));
                             continue;
                         }
                     }
@@ -201,7 +249,7 @@ impl Proxy {
                 ))
             }
             Err(e) => {
-                println!("DNS resolution error for {addr_str}: {e}");
+                self.log(LogLevel::Error, &format!("DNS resolution error for {addr_str}: {e}"));
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             }
         }
