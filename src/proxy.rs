@@ -76,25 +76,71 @@ impl Proxy {
 
     async fn tunnel<A>(self, upgraded: &mut A, addr_str: String) -> std::io::Result<()>
     where
-        A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+        A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        if let Ok(addrs) = addr_str.to_socket_addrs() {
-            for addr in addrs {
-                let socket = TcpSocket::new_v6()?;
-                let bind_addr = get_rand_ipv6_socket_addr(self.ipv6, self.prefix_len);
-                if socket.bind(bind_addr).is_ok() {
-                    println!("{addr_str} via {bind_addr}");
-                    if let Ok(mut server) = socket.connect(addr).await {
-                        tokio::io::copy_bidirectional(upgraded, &mut server).await?;
-                        return Ok(());
+        match addr_str.to_socket_addrs() {
+            Ok(addrs) => {
+                let addrs: Vec<_> = addrs.collect();
+                for addr in addrs {
+                    let socket = match TcpSocket::new_v6() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("Failed to create IPv6 socket for {addr_str}: {e}");
+                            continue;
+                        }
+                    };
+
+                    let bind_addr = get_rand_ipv6_socket_addr(self.ipv6, self.prefix_len);
+                    
+                    match socket.bind(bind_addr) {
+                        Ok(()) => {
+                            println!("{addr_str} via {bind_addr}");
+                            
+                            match socket.connect(addr).await {
+                                Ok(server) => {
+                                    let (mut client_read, mut client_write) = tokio::io::split(&mut *upgraded);
+                                    let (mut server_read, mut server_write) = tokio::io::split(server);
+
+                                    let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
+                                    let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
+
+                                    match tokio::join!(client_to_server, server_to_client) {
+                                        (Ok(_), Ok(_)) => return Ok(()),
+                                        (Err(e), _) | (_, Err(e)) => {
+                                            if e.kind() == std::io::ErrorKind::ConnectionReset {
+                                                println!("Connection reset for {addr_str}, trying next address");
+                                                continue;
+                                            }
+                                            println!("Connection error for {addr_str}: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if e.kind() == std::io::ErrorKind::InvalidInput {
+                                        println!("Invalid IPv6 address for {addr_str}, trying next address");
+                                        continue;
+                                    }
+                                    println!("Failed to connect to {addr_str}: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("Failed to bind to {bind_addr} for {addr_str}: {e}");
+                            continue;
+                        }
                     }
                 }
+                
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to establish any connection after trying all addresses",
+                ))
             }
-        } else {
-            println!("error: {addr_str}");
+            Err(e) => {
+                println!("DNS resolution error for {addr_str}: {e}");
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            }
         }
-
-        Ok(())
     }
 }
 
